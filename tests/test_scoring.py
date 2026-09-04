@@ -70,3 +70,49 @@ def test_high_stock_dividend_is_watch():
     assert len(scored) == 1
     assert scored[0].grade in {"A", "B"}
     assert scored[0].watch is True
+
+
+def test_forced_short_cover_requires_short_interest_for_watch():
+    as_of = date(2026, 9, 4)
+    thin = CorporateEvent(
+        stock_id="2330",
+        stock_name="台積電",
+        market="TWSE",
+        event_type="forced_short_cover",
+        event_date=date(2026, 9, 7),
+        source="test",
+        reason="除息",
+        short_balance=3,
+        short_utilization=0.001,
+    )
+    crowded = CorporateEvent(
+        stock_id="3141",
+        stock_name="晶宏",
+        market="TPEx",
+        event_type="forced_short_cover",
+        event_date=date(2026, 9, 7),
+        source="test",
+        reason="除權息",
+        short_balance=130,
+        short_utilization=0.68,
+    )
+    score_event(thin, as_of=as_of)
+    score_event(crowded, as_of=as_of)
+    assert crowded.score > thin.score
+    assert crowded.watch is True
+    assert thin.watch is False
+
+
+def test_convertible_bond_board_is_watch():
+    event = CorporateEvent(
+        stock_id="2492",
+        stock_name="華新科",
+        market="TWSE",
+        event_type="convertible_bond_board",
+        event_date=date(2026, 9, 4),
+        source="test",
+        detail="公告本公司董事會決議發行國內第二次無擔保轉換公司債",
+    )
+    score_event(event, as_of=date(2026, 9, 4))
+    assert event.grade in {"A", "B"}
+    assert event.watch is True
