@@ -43,3 +43,19 @@ def to_float(value: object, default: float | None = None) -> float | None:
         return float(text)
     except ValueError:
         return default
+
+
+def parse_ymd_date(value: str | None) -> date | None:
+    """解析 YYYYMMDD 或 YYYY-MM-DD。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in {"-", "—", "N/A", "null"}:
+        return None
+    compact = text.replace("-", "").replace("/", "")
+    if len(compact) == 8 and compact.isdigit():
+        try:
+            return date(int(compact[:4]), int(compact[4:6]), int(compact[6:8]))
+        except ValueError:
+            return None
+    return parse_roc_date(text)
