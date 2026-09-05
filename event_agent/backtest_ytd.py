@@ -129,7 +129,7 @@ def backtest_ex_dividend(
         if event_day > as_of:
             continue
         sid = ev["stock_id"]
-        ref = ev.get("ref_price")
+        ref = ev.get("ref_price") or ev.get("reference_price")
         trade_day = cache.find_trading_day(event_day, 1)
         if trade_day is None:
             continue
@@ -138,7 +138,7 @@ def backtest_ex_dividend(
         if entry is None or entry <= 0:
             continue
         exits = _fill_exits(cache, sid, trade_day, entry, event_day)
-        pre = ev.get("pre_close")
+        pre = ev.get("pre_close") or ev.get("pre_close_price")
         recovered = None
         if pre and exits["exit_d5"] is not None:
             recovered = exits["exit_d5"] >= pre
@@ -168,7 +168,7 @@ def backtest_short_cover(
     events: list[dict[str, Any]],
     *,
     as_of: date,
-    min_short_balance: float = 500.0,
+    min_short_balance: float = 200.0,
     min_short_util: float = 0.05,
 ) -> list[TradeRow]:
     """強制融券回補代理策略：除權息日前有足夠融券餘額者，T-5 收盤買、事件日收盤賣。

@@ -126,46 +126,53 @@ def fetch_twse_daily_quotes(d: date) -> dict[str, dict[str, float | None]]:
 def fetch_tpex_daily_quotes(d: date) -> dict[str, dict[str, float | None]]:
     cache = f"tpex_daily_{_yyyymmdd(d)}.json"
     cached = _load_cache(cache)
-    if cached is not None:
+    if cached:
         return cached
 
     url = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
-    payload = http_get_json(
-        url,
-        params={"date": d.strftime("%Y/%m/%d"), "id": "", "response": "json"},
-    )
     out: dict[str, dict[str, float | None]] = {}
+    try:
+        payload = http_get_json(
+            url,
+            params={"date": d.strftime("%Y/%m/%d"), "id": "", "response": "json"},
+            timeout=60.0,
+            retries=3,
+        )
+    except Exception:
+        # 上櫃全日行情偶發截斷；不寫空快取，以便下次重試
+        time.sleep(0.2)
+        return out
+
     tables = payload.get("tables") or []
     if not tables:
-        _save_cache(cache, out)
+        # 非交易日可快取空結果；解析失敗則不寫
+        if str(payload.get("stat") or "") not in {"", "OK"}:
+            _save_cache(cache, out)
         time.sleep(0.12)
         return out
 
+    # 新版 API：fields 在 table 上，data 直接是列
+    fields = [str(x) for x in (tables[0].get("fields") or [])]
     rows = tables[0].get("data") or []
-    # 找出標題列
-    header_idx = None
-    for i, row in enumerate(rows[:5]):
-        if row and "證券代號" in str(row[0]):
-            header_idx = i
-            break
-    if header_idx is None:
-        _save_cache(cache, out)
-        time.sleep(0.12)
-        return out
+    if not fields and rows:
+        # 相容舊格式：第一列可能是表頭
+        for i, row in enumerate(rows[:5]):
+            if row and ("證券代號" in str(row[0]) or "代號" in str(row[0])):
+                fields = [str(x) for x in row]
+                rows = rows[i + 1 :]
+                break
 
-    fields = [str(x) for x in rows[header_idx]]
     try:
-        id_i = fields.index("證券代號")
+        id_i = next(i for i, f in enumerate(fields) if f in {"證券代號", "代號"})
         open_i = next(i for i, f in enumerate(fields) if "開盤" in f)
         high_i = next(i for i, f in enumerate(fields) if "最高" in f)
         low_i = next(i for i, f in enumerate(fields) if "最低" in f)
         close_i = next(i for i, f in enumerate(fields) if "收盤" in f)
-    except (ValueError, StopIteration):
-        _save_cache(cache, out)
+    except StopIteration:
         time.sleep(0.12)
         return out
 
-    for row in rows[header_idx + 1 :]:
+    for row in rows:
         if not row or len(row) <= max(id_i, close_i):
             continue
         sid = str(row[id_i]).strip()
@@ -177,7 +184,8 @@ def fetch_tpex_daily_quotes(d: date) -> dict[str, dict[str, float | None]]:
             "low": to_float(row[low_i]),
             "close": to_float(row[close_i]),
         }
-    _save_cache(cache, out)
+    if out:
+        _save_cache(cache, out)
     time.sleep(0.12)
     return out
 
@@ -185,30 +193,46 @@ def fetch_tpex_daily_quotes(d: date) -> dict[str, dict[str, float | None]]:
 def fetch_twse_margin_map(d: date) -> dict[str, dict[str, float | None]]:
     cache = f"twse_margin_{_yyyymmdd(d)}.json"
     cached = _load_cache(cache)
-    if cached is not None:
+    # 空 dict 視為快取未命中（避免舊版解析失敗永久污染）
+    if cached:
         return cached
 
     url = "https://www.twse.com.tw/exchangeReport/MI_MARGN"
-    payload = http_get_json(
-        url,
-        params={"response": "json", "date": _yyyymmdd(d), "selectType": "ALL"},
-    )
     out: dict[str, dict[str, float | None]] = {}
+    try:
+        payload = http_get_json(
+            url,
+            params={"response": "json", "date": _yyyymmdd(d), "selectType": "ALL"},
+        )
+    except Exception:
+        time.sleep(0.2)
+        return out
+
     tables = payload.get("tables") or []
     if len(tables) < 2:
         _save_cache(cache, out)
         time.sleep(0.12)
         return out
-    fields = tables[1].get("fields") or []
-    try:
-        id_i = fields.index("股票代號")
-        bal_i = next(i for i, f in enumerate(fields) if "融券" in f and "今日餘額" in f)
-        limit_i = next(i for i, f in enumerate(fields) if "融券" in f and "限額" in f)
-    except (ValueError, StopIteration):
-        _save_cache(cache, out)
+
+    fields = [str(x) for x in (tables[1].get("fields") or [])]
+    # 欄位重複：前段融資、後段融券。取第二次「今日餘額／限額」。
+    id_i = None
+    for cand in ("代號", "股票代號", "證券代號"):
+        if cand in fields:
+            id_i = fields.index(cand)
+            break
+    bal_indices = [i for i, f in enumerate(fields) if f == "今日餘額"]
+    limit_indices = [i for i, f in enumerate(fields) if "限額" in f]
+    if id_i is None or len(bal_indices) < 2 or len(limit_indices) < 2:
+        # 解析失敗不寫空快取，避免永久污染
         time.sleep(0.12)
         return out
+
+    bal_i = bal_indices[1]
+    limit_i = limit_indices[1]
     for row in tables[1].get("data") or []:
+        if not row or len(row) <= max(id_i, bal_i, limit_i):
+            continue
         sid = str(row[id_i]).strip()
         if len(sid) != 4 or not sid.isdigit():
             continue
@@ -225,49 +249,75 @@ class MarketQuoteCache:
     """依日期快取上市／上櫃收盤截面，避免逐檔打 API。"""
 
     def __init__(self) -> None:
-        self._quotes: dict[str, dict[str, dict[str, float | None]]] = {}
+        self._twse: dict[str, dict[str, dict[str, float | None]]] = {}
+        self._tpex: dict[str, dict[str, dict[str, float | None]]] = {}
         self._margin: dict[str, dict[str, dict[str, float | None]]] = {}
+        self._tpex_attempted: set[str] = set()
+
+    def _twse_on(self, d: date) -> dict[str, dict[str, float | None]]:
+        key = d.isoformat()
+        if key not in self._twse:
+            try:
+                self._twse[key] = fetch_twse_daily_quotes(d)
+            except Exception:
+                self._twse[key] = {}
+        return self._twse[key]
+
+    def _tpex_on(self, d: date) -> dict[str, dict[str, float | None]]:
+        key = d.isoformat()
+        if key in self._tpex:
+            return self._tpex[key]
+        try:
+            data = fetch_tpex_daily_quotes(d)
+        except Exception:
+            data = {}
+        # 只有成功取到資料才快取；空結果允許之後重試（API 偶發失敗）
+        if data:
+            self._tpex[key] = data
+        return data
 
     def quotes_on(self, d: date) -> dict[str, dict[str, float | None]]:
-        key = d.isoformat()
-        if key not in self._quotes:
-            merged = dict(fetch_twse_daily_quotes(d))
-            for sid, q in fetch_tpex_daily_quotes(d).items():
-                merged.setdefault(sid, q)
-            self._quotes[key] = merged
-        return self._quotes[key]
+        """合併截面（會觸發上櫃抓取；交易日探測請用 has_session）。"""
+        merged = dict(self._twse_on(d))
+        for sid, q in self._tpex_on(d).items():
+            merged.setdefault(sid, q)
+        return merged
+
+    def has_session(self, d: date) -> bool:
+        """用上市截面判斷是否為交易日，避免為了對齊日曆去打上櫃。"""
+        return bool(self._twse_on(d))
 
     def price(self, stock_id: str, d: date, field: str = "close") -> float | None:
-        q = self.quotes_on(d).get(stock_id)
+        q = self._twse_on(d).get(stock_id)
+        if not q:
+            q = self._tpex_on(d).get(stock_id)
         if not q:
             return None
         return q.get(field)  # type: ignore[return-value]
 
-    def find_trading_day(self, start: date, direction: int = 1, max_days: int = 12) -> date | None:
+    def find_trading_day(self, start: date, direction: int = 1, max_days: int = 14) -> date | None:
         d = start
         for _ in range(max_days):
-            if self.quotes_on(d):
+            if d.weekday() < 5 and self.has_session(d):
                 return d
             d = d + timedelta(days=direction)
         return None
 
     def shift_trading_days(self, start: date, n: int) -> date | None:
-        if n == 0:
-            return self.find_trading_day(start, 1)
-        d = start
-        stepped = 0
         direction = 1 if n > 0 else -1
-        target = abs(n)
-        # 先對齊到最近交易日
-        aligned = self.find_trading_day(start, direction if n > 0 else -1)
+        aligned = self.find_trading_day(start, direction if n != 0 else 1)
         if aligned is None:
             return None
-        d = aligned
         if n == 0:
-            return d
+            return aligned
+        d = aligned
+        stepped = 0
+        target = abs(n)
         while stepped < target:
             d = d + timedelta(days=direction)
-            if self.quotes_on(d):
+            if d.weekday() >= 5:
+                continue
+            if self.has_session(d):
                 stepped += 1
             if abs((d - start).days) > 45:
                 return None
@@ -276,7 +326,10 @@ class MarketQuoteCache:
     def margin_on(self, d: date) -> dict[str, dict[str, float | None]]:
         key = d.isoformat()
         if key not in self._margin:
-            self._margin[key] = fetch_twse_margin_map(d)
+            try:
+                self._margin[key] = fetch_twse_margin_map(d)
+            except Exception:
+                self._margin[key] = {}
         return self._margin[key]
 
 
