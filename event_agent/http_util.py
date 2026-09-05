@@ -5,6 +5,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.client import IncompleteRead
 from typing import Any
 
 
@@ -22,9 +23,9 @@ def http_get_json(
     *,
     params: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
-    timeout: float = 30.0,
-    retries: int = 3,
-    sleep: float = 0.4,
+    timeout: float = 45.0,
+    retries: int = 4,
+    sleep: float = 0.6,
 ) -> Any:
     if params:
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
@@ -43,7 +44,14 @@ def http_get_json(
                 if not raw:
                     return None
                 return json.loads(raw.decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            IncompleteRead,
+            ConnectionError,
+            OSError,
+        ) as exc:
             last_error = exc
             if attempt + 1 < retries:
                 time.sleep(sleep * (attempt + 1))
