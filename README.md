@@ -49,6 +49,7 @@
 - 合併最新收盤價，估算現金殖利率
 - 規則評分（A/B/C/D）並輸出 Markdown + JSON 日報（含軋空／可轉債專區）
 - 面額變更恢復日簡易回測
+- **今年（YTD）三策略回測**：除權息回補、融券回補代理、可轉債掛牌（含面額變更），並挑高勝率標的
 
 ## 快速開始
 
@@ -63,12 +64,16 @@ python -m event_agent monitor --no-prices
 
 # 面額變更歷史回測
 python -m event_agent backtest-par-value
+
+# 今年事件策略回測 + 高勝率選股
+python -m event_agent backtest-2026
 ```
 
 輸出預設在 `output/`：
 
 - `watchlist_latest.md` / `watchlist_latest.json`
 - `backtest_par_value.md` / `backtest_par_value.json`
+- `backtest_2026_latest.md` / `backtest_2026_latest.json`
 
 ## 評分邏輯（透明規則）
 
