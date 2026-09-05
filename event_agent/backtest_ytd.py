@@ -34,6 +34,28 @@ class TradeRow:
     note: str = ""
 
 
+@dataclass(slots=True)
+class PeakExitTrade:
+    """T-5 進場：期間有高點就出場，否則強制抱到 T+5。"""
+
+    strategy: str
+    stock_id: str
+    stock_name: str
+    event_date: str
+    entry_date: str
+    entry_price: float
+    exit_date: str
+    exit_price: float
+    exit_reason: str  # peak_high | first_high_close | forced_t5
+    ret_pct: float
+    peak_high: float | None = None
+    peak_date: str | None = None
+    t5_close: float | None = None
+    ret_hold_t5_pct: float | None = None
+    short_balance: float | None = None
+    note: str = ""
+
+
 def _ret(exit_px: float | None, entry: float) -> float | None:
     if exit_px is None or entry <= 0:
         return None
@@ -115,17 +137,186 @@ def _fill_exits(
     }
 
 
+def _trading_days_after_through(
+    cache: MarketQuoteCache,
+    after: date,
+    through: date,
+) -> list[date]:
+    days: list[date] = []
+    d = cache.shift_trading_days(after, 1)
+    while d is not None and d <= through:
+        days.append(d)
+        d = cache.shift_trading_days(d, 1)
+        if len(days) > 40:
+            break
+    return days
+
+
+def resolve_peak_or_t5_exit(
+    cache: MarketQuoteCache,
+    stock_id: str,
+    entry_day: date,
+    entry_price: float,
+    event_day: date,
+    *,
+    mode: str = "peak_high",
+) -> dict[str, Any] | None:
+    """T-5 進場後的出場規則。
+
+    - peak_high：持有區間最高價 > 進場價時，以該最高價出場（樂觀上界）
+    - first_high_close：首次出現高點 > 進場價當日，以收盤價出場（較可執行）
+    兩者若整段都沒有高於進場價的高點，則 T+5 收盤強制出場。
+    """
+    t5 = cache.shift_trading_days(event_day, 5)
+    if t5 is None:
+        return None
+    window = _trading_days_after_through(cache, entry_day, t5)
+    if not window:
+        return None
+
+    peak_high: float | None = None
+    peak_day: date | None = None
+    first_high_day: date | None = None
+    first_high_close: float | None = None
+
+    for d in window:
+        high = cache.price(stock_id, d, "high")
+        close = cache.price(stock_id, d, "close")
+        if high is None:
+            continue
+        if peak_high is None or high > peak_high:
+            peak_high = high
+            peak_day = d
+        if first_high_day is None and high > entry_price and close is not None:
+            first_high_day = d
+            first_high_close = close
+
+    t5_close = cache.price(stock_id, t5, "close")
+    if t5_close is None:
+        return None
+
+    if mode == "first_high_close":
+        if first_high_day is not None and first_high_close is not None:
+            exit_day, exit_price, reason = first_high_day, first_high_close, "first_high_close"
+        else:
+            exit_day, exit_price, reason = t5, t5_close, "forced_t5"
+    else:
+        if peak_high is not None and peak_day is not None and peak_high > entry_price:
+            exit_day, exit_price, reason = peak_day, peak_high, "peak_high"
+        else:
+            exit_day, exit_price, reason = t5, t5_close, "forced_t5"
+
+    ret = _ret(exit_price, entry_price)
+    if ret is None:
+        return None
+    return {
+        "exit_date": exit_day.isoformat(),
+        "exit_price": float(exit_price),
+        "exit_reason": reason,
+        "ret_pct": float(ret),
+        "peak_high": peak_high,
+        "peak_date": peak_day.isoformat() if peak_day else None,
+        "t5_close": t5_close,
+        "ret_hold_t5_pct": _ret(t5_close, entry_price),
+        "entry_date": entry_day.isoformat(),
+    }
+
+
+def _summarize_peak(rows: list[PeakExitTrade]) -> dict[str, Any]:
+    vals = [r.ret_pct for r in rows]
+    if not vals:
+        return {"sample_size": 0}
+    wins = [v for v in vals if v > 0]
+    peak_exits = sum(1 for r in rows if r.exit_reason != "forced_t5")
+    forced = sum(1 for r in rows if r.exit_reason == "forced_t5")
+    hold_vals = [r.ret_hold_t5_pct for r in rows if r.ret_hold_t5_pct is not None]
+    return {
+        "sample_size": len(vals),
+        "win_rate": len(wins) / len(vals),
+        "avg_return_pct": mean(vals),
+        "median_return_pct": sorted(vals)[len(vals) // 2],
+        "avg_win_pct": mean(wins) if wins else 0.0,
+        "avg_loss_pct": mean([v for v in vals if v <= 0]) if any(v <= 0 for v in vals) else 0.0,
+        "best_pct": max(vals),
+        "worst_pct": min(vals),
+        "peak_exit_rate": peak_exits / len(vals),
+        "forced_t5_rate": forced / len(vals),
+        "avg_hold_t5_return_pct": mean(hold_vals) if hold_vals else None,
+    }
+
+
+def backtest_t5_peak_or_hold(
+    cache: MarketQuoteCache,
+    events: list[dict[str, Any]],
+    *,
+    strategy: str,
+    as_of: date,
+    mode: str = "peak_high",
+    entry_offset: int = -5,
+    min_short_balance: float | None = None,
+    min_short_util: float = 0.05,
+) -> list[PeakExitTrade]:
+    rows: list[PeakExitTrade] = []
+    for ev in events:
+        event_day = date.fromisoformat(ev["event_date"])
+        t5 = cache.shift_trading_days(event_day, 5)
+        if t5 is None or t5 > as_of:
+            continue
+        sid = ev["stock_id"]
+        entry_day = cache.shift_trading_days(event_day, entry_offset)
+        if entry_day is None:
+            continue
+        entry = cache.price(sid, entry_day, "close")
+        if entry is None or entry <= 0:
+            continue
+
+        bal = None
+        if min_short_balance is not None:
+            margin = cache.margin_on(entry_day).get(sid) or {}
+            bal = margin.get("short_balance")
+            util = margin.get("short_util")
+            if bal is None:
+                continue
+            if bal < min_short_balance and (util is None or util < min_short_util):
+                continue
+
+        resolved = resolve_peak_or_t5_exit(
+            cache, sid, entry_day, float(entry), event_day, mode=mode
+        )
+        if resolved is None:
+            continue
+        rows.append(
+            PeakExitTrade(
+                strategy=strategy,
+                stock_id=sid,
+                stock_name=ev.get("stock_name") or "",
+                event_date=ev["event_date"],
+                entry_date=resolved["entry_date"],
+                entry_price=float(entry),
+                exit_date=resolved["exit_date"],
+                exit_price=resolved["exit_price"],
+                exit_reason=resolved["exit_reason"],
+                ret_pct=resolved["ret_pct"],
+                peak_high=resolved["peak_high"],
+                peak_date=resolved["peak_date"],
+                t5_close=resolved["t5_close"],
+                ret_hold_t5_pct=resolved["ret_hold_t5_pct"],
+                short_balance=bal,
+                note=f"T{entry_offset}→高點或T+5；mode={mode}",
+            )
+        )
+    return rows
+
+
 def backtest_ex_dividend(
     cache: MarketQuoteCache,
     events: list[dict[str, Any]],
     *,
     as_of: date,
 ) -> list[TradeRow]:
-    """除權息回補：以除權息參考價（或當日開盤）進場，持有至 D0 / D+5 / D+10。"""
     rows: list[TradeRow] = []
     for ev in events:
         event_day = date.fromisoformat(ev["event_date"])
-        # 需至少有 +10 交易日空間才算完整樣本；否則仍算到 as_of 能取到的
         if event_day > as_of:
             continue
         sid = ev["stock_id"]
@@ -171,11 +362,6 @@ def backtest_short_cover(
     min_short_balance: float = 200.0,
     min_short_util: float = 0.05,
 ) -> list[TradeRow]:
-    """強制融券回補代理策略：除權息日前有足夠融券餘額者，T-5 收盤買、事件日收盤賣。
-
-    說明：停券／最後回補日多貼近除權息，公開歷史停券清單不易一次拉齊，
-    故以「除權息 + 事前融券水位」作為可回測的代理事件。
-    """
     rows: list[TradeRow] = []
     for ev in events:
         event_day = date.fromisoformat(ev["event_date"])
@@ -188,7 +374,6 @@ def backtest_short_cover(
         entry = cache.price(sid, entry_day, "close")
         if entry is None or entry <= 0:
             continue
-        # 用進場日融券水位過濾
         margin = cache.margin_on(entry_day).get(sid) or {}
         bal = margin.get("short_balance")
         util = margin.get("short_util")
@@ -225,7 +410,6 @@ def backtest_par_value_split(
     *,
     as_of: date,
 ) -> list[TradeRow]:
-    """面額變更／分割：以恢復日後參考價（after_price）進場。"""
     rows: list[TradeRow] = []
     for ev in events:
         event_day = date.fromisoformat(ev["event_date"])
@@ -265,7 +449,6 @@ def backtest_cb_listing(
     *,
     as_of: date,
 ) -> list[TradeRow]:
-    """可轉債掛牌：掛牌前一交易日收盤買進現股，觀察掛牌日／+5／+10。"""
     rows: list[TradeRow] = []
     for ev in events:
         event_day = date.fromisoformat(ev["event_date"])
@@ -314,7 +497,7 @@ def pick_high_winrate_stocks(
             for r in ranked
             if r["win_rate"] >= min_win_rate and r["avg_d5_return_pct"] >= min_avg_return
         ][:25]
-    # 綜合：同一檔在多策略皆佳
+
     cross: dict[str, dict[str, Any]] = {}
     for name, items in picks.items():
         for item in items:
@@ -336,12 +519,11 @@ def pick_high_winrate_stocks(
                 slot["best_avg_d5_return_pct"], item["avg_d5_return_pct"]
             )
             slot["total_trades"] += item["trades"]
-    cross_list = sorted(
+    picks["cross_strategy"] = sorted(
         cross.values(),
         key=lambda x: (len(x["strategies_hit"]), x["best_win_rate"], x["best_avg_d5_return_pct"]),
         reverse=True,
-    )
-    picks["cross_strategy"] = cross_list[:30]
+    )[:30]
     return picks
 
 
@@ -376,7 +558,8 @@ def run_ytd_backtest(
             "d5": _summarize(rows, "d5"),
             "d10": _summarize(rows, "d10"),
             "pct_recovered_pre_close": (
-                sum(1 for r in rows if r.recovered_pre_close) / sum(1 for r in rows if r.recovered_pre_close is not None)
+                sum(1 for r in rows if r.recovered_pre_close)
+                / sum(1 for r in rows if r.recovered_pre_close is not None)
                 if any(r.recovered_pre_close is not None for r in rows)
                 else None
             ),
@@ -386,7 +569,35 @@ def run_ytd_backtest(
 
     picks = pick_high_winrate_stocks(by_strategy, min_trades=2, min_win_rate=0.6)
 
-    # 單次事件但報酬突出者也列為觀察（樣本=1，標註）
+    peak_by: dict[str, list[PeakExitTrade]] = {}
+    first_by: dict[str, list[PeakExitTrade]] = {}
+    specs = [
+        ("ex_dividend_reclaim", exdiv, None),
+        ("short_cover_proxy", exdiv, 200.0),
+        ("par_value_split", splits, None),
+        ("cb_listing", cbs, None),
+    ]
+    for name, events, min_short in specs:
+        peak_by[name] = backtest_t5_peak_or_hold(
+            cache,
+            events,
+            strategy=name,
+            as_of=end,
+            mode="peak_high",
+            min_short_balance=min_short,
+        )
+        first_by[name] = backtest_t5_peak_or_hold(
+            cache,
+            events,
+            strategy=name,
+            as_of=end,
+            mode="first_high_close",
+            min_short_balance=min_short,
+        )
+
+    peak_summary = {name: _summarize_peak(rows) for name, rows in peak_by.items()}
+    first_summary = {name: _summarize_peak(rows) for name, rows in first_by.items()}
+
     single_event_stars: list[dict[str, Any]] = []
     for name, rows in by_strategy.items():
         for r in rows:
@@ -410,12 +621,12 @@ def run_ytd_backtest(
             "end": end.isoformat(),
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "assumptions": [
-                "除權息樣本以證交所 TWT49U 上市股票為主（上櫃歷史除權息 API 不穩，暫未納入）",
-                "除權息策略：事件日參考價進場，觀察 D0/D+5/D+10 收盤",
-                "融券回補：以除權息前融券水位作代理，T-5 收盤進、事件日後持有",
-                "面額變更：FinMind TaiwanStockSplitPrice",
-                "可轉債：TPEx bond_ISSBD5 有掛牌日者，掛牌前一日收盤買現股",
-                "勝率以 D+5 報酬 > 0 計算；高勝率標的需至少 2 筆同策略事件",
+                "除權息樣本以證交所上市為主",
+                "基準策略：固定持有至 D0/D+5/D+10",
+                "新規則：一律 T-5 收盤進場；期間若有高於進場價的高點可出場，否則 T+5 收盤強制出場",
+                "peak_high：摸到期間最高價出場（樂觀上界）",
+                "first_high_close：首次出現高點當日收盤出場（較可執行）",
+                "融券回補仍過濾進場日融券水位",
             ],
             "event_counts": {
                 "ex_dividend_events": len(exdiv),
@@ -424,21 +635,34 @@ def run_ytd_backtest(
             },
         },
         "summary": summary,
+        "t5_peak_exit": {
+            "peak_high": {
+                "summary": peak_summary,
+                "rows": {k: [asdict(r) for r in v] for k, v in peak_by.items()},
+            },
+            "first_high_close": {
+                "summary": first_summary,
+                "rows": {k: [asdict(r) for r in v] for k, v in first_by.items()},
+            },
+        },
         "high_winrate_picks": picks,
         "single_event_stars": single_event_stars[:40],
-        "rows": {
-            name: [asdict(r) for r in rows]
-            for name, rows in by_strategy.items()
-        },
+        "rows": {name: [asdict(r) for r in rows] for name, rows in by_strategy.items()},
     }
 
 
 def render_ytd_markdown(result: dict[str, Any]) -> str:
     meta = result["meta"]
+    name_map = {
+        "ex_dividend_reclaim": "除權息回補",
+        "short_cover_proxy": "融券回補（代理）",
+        "par_value_split": "面額變更／分割",
+        "cb_listing": "可轉債掛牌",
+    }
     lines = [
         f"# 2026 事件驅動策略回測（{meta['start']} ~ {meta['end']}）",
         "",
-        "> 本報告僅供研究，不構成投資建議。樣本期短、有倖存者偏誤與流動性限制。",
+        "> 本報告僅供研究，不構成投資建議。",
         "",
         "## 方法假設",
         "",
@@ -453,16 +677,9 @@ def render_ytd_markdown(result: dict[str, Any]) -> str:
         f"- 面額變更／分割：{meta['event_counts']['split_events']}",
         f"- 可轉債掛牌：{meta['event_counts']['cb_listing_events']}",
         "",
-        "## 策略績效摘要（報酬單位：%）",
+        "## 基準策略績效（固定持有）",
         "",
     ]
-
-    name_map = {
-        "ex_dividend_reclaim": "除權息回補",
-        "short_cover_proxy": "融券回補（代理）",
-        "par_value_split": "面額變更／分割",
-        "cb_listing": "可轉債掛牌",
-    }
     for key, title in name_map.items():
         s = result["summary"].get(key) or {}
         lines.append(f"### {title}")
@@ -476,22 +693,63 @@ def render_ytd_markdown(result: dict[str, Any]) -> str:
                 f"- **{hz.upper()}**：樣本 {block['sample_size']}，"
                 f"勝率 {block['win_rate']:.1%}，"
                 f"平均 {block['avg_return_pct']:.2f}%，"
-                f"中位 {block['median_return_pct']:.2f}%，"
-                f"最佳 {block['best_pct']:.2f}%／最差 {block['worst_pct']:.2f}%"
+                f"中位 {block['median_return_pct']:.2f}%"
             )
-        recovered = s.get("pct_recovered_pre_close")
-        if recovered is not None:
-            lines.append(f"- D+5 收復除權息前收盤價比例：{recovered:.1%}")
         lines.append("")
 
-    lines += ["## 未來再遇事件時，勝率較高標的（D+5，同策略≥2 次且勝率≥60%）", ""]
+    t5 = result.get("t5_peak_exit") or {}
+    lines += [
+        "## T-5 進場＋有高點出場／否則抱到 T+5",
+        "",
+        "### A. 樂觀版：摸到期間最高價出場（peak_high）",
+        "",
+    ]
+    for key, title in name_map.items():
+        block = ((t5.get("peak_high") or {}).get("summary") or {}).get(key) or {}
+        lines.append(f"#### {title}")
+        if not block.get("sample_size"):
+            lines.append("- 無有效樣本")
+            lines.append("")
+            continue
+        lines.append(
+            f"- 樣本 {block['sample_size']}，勝率 {block['win_rate']:.1%}，"
+            f"平均報酬 {block['avg_return_pct']:.2f}%，中位 {block['median_return_pct']:.2f}%"
+        )
+        lines.append(
+            f"- 高點出場占比 {block['peak_exit_rate']:.1%}，"
+            f"強制 T+5 占比 {block['forced_t5_rate']:.1%}"
+        )
+        if block.get("avg_hold_t5_return_pct") is not None:
+            lines.append(f"- 對照：若一律抱到 T+5，平均 {block['avg_hold_t5_return_pct']:.2f}%")
+        lines.append("")
+
+    lines += ["### B. 可執行版：首次出現高點當日收盤出場（first_high_close）", ""]
+    for key, title in name_map.items():
+        block = ((t5.get("first_high_close") or {}).get("summary") or {}).get(key) or {}
+        lines.append(f"#### {title}")
+        if not block.get("sample_size"):
+            lines.append("- 無有效樣本")
+            lines.append("")
+            continue
+        lines.append(
+            f"- 樣本 {block['sample_size']}，勝率 {block['win_rate']:.1%}，"
+            f"平均報酬 {block['avg_return_pct']:.2f}%，中位 {block['median_return_pct']:.2f}%"
+        )
+        lines.append(
+            f"- 高點出場占比 {block['peak_exit_rate']:.1%}，"
+            f"強制 T+5 占比 {block['forced_t5_rate']:.1%}"
+        )
+        if block.get("avg_hold_t5_return_pct") is not None:
+            lines.append(f"- 對照：若一律抱到 T+5，平均 {block['avg_hold_t5_return_pct']:.2f}%")
+        lines.append("")
+
+    lines += ["## 高勝率標的（基準策略 D+5）", ""]
     picks = result.get("high_winrate_picks") or {}
     for key, title in name_map.items():
         items = picks.get(key) or []
         lines.append(f"### {title}")
-        lines.append("")
         if not items:
-            lines.append("- （無符合門檻者；樣本不足或勝率未達標）")
+            lines.append("- （無）")
             lines.append("")
             continue
         lines.append("| 代號 | 名稱 | 次數 | 勝率 | 平均D+5% |")
@@ -503,30 +761,5 @@ def render_ytd_markdown(result: dict[str, Any]) -> str:
             )
         lines.append("")
 
-    cross = picks.get("cross_strategy") or []
-    lines += ["### 跨策略綜合觀察", ""]
-    if not cross:
-        lines.append("- 無")
-    else:
-        lines.append("| 代號 | 名稱 | 命中策略數 | 最佳勝率 | 最佳平均D+5% | 總次數 |")
-        lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
-        for it in cross[:20]:
-            lines.append(
-                f"| {it['stock_id']} | {it['stock_name']} | {len(it['strategies_hit'])} | "
-                f"{it['best_win_rate']:.0%} | {it['best_avg_d5_return_pct']:.2f} | {it['total_trades']} |"
-            )
-    lines += ["", "## 單次事件高報酬觀察（D+5≥8%，樣本=1，勿過度解讀）", ""]
-    stars = result.get("single_event_stars") or []
-    if not stars:
-        lines.append("- 無")
-    else:
-        lines.append("| 策略 | 代號 | 名稱 | 事件日 | D+5% | D0% |")
-        lines.append("| --- | --- | --- | --- | ---: | ---: |")
-        for it in stars[:25]:
-            lines.append(
-                f"| {name_map.get(it['strategy'], it['strategy'])} | {it['stock_id']} | "
-                f"{it['stock_name']} | {it['event_date']} | {it['ret_d5_pct']:.2f} | "
-                f"{(it.get('ret_d0_pct') or 0):.2f} |"
-            )
     lines.append("")
     return "\n".join(lines)

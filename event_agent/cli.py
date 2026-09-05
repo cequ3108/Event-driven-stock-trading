@@ -126,6 +126,45 @@ def main(argv: list[str] | None = None) -> int:
                     f"  {title}：n={d5['sample_size']} 勝率={d5['win_rate']:.0%} "
                     f"平均D+5={d5['avg_return_pct']:.2f}%"
                 )
+
+            print("\n【T-5進場｜有高點出場／否則T+5】樂觀摸高（peak_high）")
+            peak = ((result.get("t5_peak_exit") or {}).get("peak_high") or {}).get("summary") or {}
+            for key, title in (
+                ("ex_dividend_reclaim", "除權息"),
+                ("short_cover_proxy", "融券回補"),
+                ("par_value_split", "面額變更"),
+                ("cb_listing", "可轉債"),
+            ):
+                s = peak.get(key) or {}
+                if not s.get("sample_size"):
+                    print(f"  {title}：無樣本")
+                    continue
+                print(
+                    f"  {title}：n={s['sample_size']} 勝率={s['win_rate']:.0%} "
+                    f"平均={s['avg_return_pct']:.2f}% "
+                    f"高點出場={s['peak_exit_rate']:.0%} "
+                    f"對照抱T+5={s.get('avg_hold_t5_return_pct')}"
+                )
+
+            print("\n【T-5進場｜首次高點日收盤出場】（first_high_close，較可執行）")
+            first = ((result.get("t5_peak_exit") or {}).get("first_high_close") or {}).get("summary") or {}
+            for key, title in (
+                ("ex_dividend_reclaim", "除權息"),
+                ("short_cover_proxy", "融券回補"),
+                ("par_value_split", "面額變更"),
+                ("cb_listing", "可轉債"),
+            ):
+                s = first.get(key) or {}
+                if not s.get("sample_size"):
+                    print(f"  {title}：無樣本")
+                    continue
+                print(
+                    f"  {title}：n={s['sample_size']} 勝率={s['win_rate']:.0%} "
+                    f"平均={s['avg_return_pct']:.2f}% "
+                    f"高點出場={s['peak_exit_rate']:.0%} "
+                    f"對照抱T+5={s.get('avg_hold_t5_return_pct')}"
+                )
+
             picks = (result.get("high_winrate_picks") or {}).get("cross_strategy") or []
             if picks:
                 print("\n高勝率綜合觀察（前8）：")
